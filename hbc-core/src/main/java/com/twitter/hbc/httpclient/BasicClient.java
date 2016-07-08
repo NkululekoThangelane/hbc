@@ -24,7 +24,11 @@ import com.twitter.hbc.core.endpoint.StreamingEndpoint;
 import com.twitter.hbc.core.event.Event;
 import com.twitter.hbc.core.processor.HosebirdMessageProcessor;
 import com.twitter.hbc.httpclient.auth.Authentication;
+
+import org.apache.http.auth.AuthScope;
+import org.apache.http.auth.Credentials;
 import org.apache.http.client.HttpClient;
+import org.apache.http.conn.params.ConnRoutePNames;
 import org.apache.http.conn.scheme.SchemeRegistry;
 import org.apache.http.impl.client.DefaultHttpClient;
 import org.apache.http.impl.conn.PoolingClientConnectionManager;
@@ -33,6 +37,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
+
+import java.net.URI;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -43,108 +49,131 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class BasicClient implements Client {
 
-  private final static int DEFAULT_STOP_TIMEOUT_MILLIS = 5000;
+    private final static int DEFAULT_STOP_TIMEOUT_MILLIS = 5000;
 
-  private final ExecutorService executorService;
+    private final ExecutorService executorService;
 
-  private final ClientBase clientBase;
-  private final AtomicBoolean canRun;
+    private final ClientBase clientBase;
+    private final AtomicBoolean canRun;
 
-  private final static Logger logger = LoggerFactory.getLogger(BasicClient.class);
+    private final static Logger logger = LoggerFactory.getLogger(BasicClient.class);
 
-  public BasicClient(String name, Hosts hosts, StreamingEndpoint endpoint, Authentication auth, boolean enableGZip, HosebirdMessageProcessor processor,
-                     ReconnectionManager reconnectionManager, RateTracker rateTracker, ExecutorService executorService,
-                     @Nullable BlockingQueue<Event> eventsQueue, HttpParams params, SchemeRegistry schemeRegistry) {
-    Preconditions.checkNotNull(auth);
-    HttpClient client;
-    if (enableGZip) {
-      client = new RestartableHttpClient(auth, enableGZip, params, schemeRegistry);
-    } else {
-      DefaultHttpClient defaultClient = new DefaultHttpClient(new PoolingClientConnectionManager(schemeRegistry), params);
+    
+    public BasicClient(String name, Hosts hosts, StreamingEndpoint endpoint, Authentication auth, Credentials proxyAuth, boolean enableGZip, HosebirdMessageProcessor processor, ReconnectionManager reconnectionManager,
+            RateTracker rateTracker, ExecutorService executorService, @Nullable BlockingQueue<Event> eventsQueue, HttpParams params, SchemeRegistry schemeRegistry) {
+        Preconditions.checkNotNull(auth);
+        HttpClient client;
+        if (enableGZip) {
+            client = new RestartableHttpClient(auth, proxyAuth, enableGZip, params, schemeRegistry);
+        } else {
+            DefaultHttpClient defaultClient = new DefaultHttpClient(new PoolingClientConnectionManager(schemeRegistry), params);
 
-      /** Set auth **/
-      auth.setupConnection(defaultClient);
-      client = defaultClient;
+            /** Set auth **/
+            auth.setupConnection(defaultClient);
+            if (proxyAuth != null) {
+                URI proxy = URI.create((String) defaultClient.getParams().getParameter(ConnRoutePNames.DEFAULT_PROXY));
+                defaultClient.getCredentialsProvider().setCredentials(new AuthScope(proxy.getHost(),proxy.getPort()), proxyAuth);
+            }
+            
+            client = defaultClient;
+        }
+
+        this.canRun = new AtomicBoolean(true);
+        this.executorService = executorService;
+        this.clientBase = new ClientBase(name, client, hosts, endpoint, auth, processor, reconnectionManager, rateTracker, eventsQueue);
     }
 
-    this.canRun = new AtomicBoolean(true);
-    this.executorService = executorService;
-    this.clientBase = new ClientBase(name, client, hosts, endpoint, auth, processor, reconnectionManager, rateTracker, eventsQueue);
-  }
+    public BasicClient(String name, Hosts hosts, StreamingEndpoint endpoint, Authentication auth, boolean enableGZip, HosebirdMessageProcessor processor, ReconnectionManager reconnectionManager,
+            RateTracker rateTracker, ExecutorService executorService, @Nullable BlockingQueue<Event> eventsQueue, HttpParams params, SchemeRegistry schemeRegistry) {
+        Preconditions.checkNotNull(auth);
+        HttpClient client;
+        if (enableGZip) {
+            client = new RestartableHttpClient(auth, enableGZip, params, schemeRegistry);
+        } else {
+            DefaultHttpClient defaultClient = new DefaultHttpClient(new PoolingClientConnectionManager(schemeRegistry), params);
 
-  /**
-   * For testing only
-   */
-  @VisibleForTesting
-  BasicClient(final ClientBase clientBase, ExecutorService executorService) {
-    this.canRun = new AtomicBoolean(true);
-    this.clientBase = clientBase;
-    this.executorService = executorService;
-  }
+            /** Set auth **/
+            auth.setupConnection(defaultClient);
+            client = defaultClient;
+        }
 
-  /**
-   * {@inheritDoc}
-   * Forks a new thread to do the IO in.
-   */
-  @Override
-  public void connect() {
-    if (!canRun.compareAndSet(true, false) || clientBase.isDone()) {
-      throw new IllegalStateException("There is already a connection thread running for " + this.clientBase);
+        this.canRun = new AtomicBoolean(true);
+        this.executorService = executorService;
+        this.clientBase = new ClientBase(name, client, hosts, endpoint, auth, processor, reconnectionManager, rateTracker, eventsQueue);
     }
-    executorService.execute(clientBase);
-    logger.info("New connection executed: {}", this.clientBase);
-  }
 
-  @Override
-  public StatsReporter.StatsTracker getStatsTracker() {
-    return clientBase.getStatsTracker();
-  }
-
-  public boolean isDone() {
-    return clientBase.isDone();
-  }
-
-  /**
-   * This method should only be called after the client is done
-   */
-  public Event getExitEvent() {
-    return clientBase.getExitEvent();
-  }
-
-  @Override
-  public void stop() {
-    stop(DEFAULT_STOP_TIMEOUT_MILLIS);
-  }
-
-  @Override
-  public void stop(int waitMillis) {
-    logger.info("Stopping the client: " + this.clientBase);
-    try {
-      clientBase.stop(waitMillis);
-      logger.info("Successfully stopped the client: {}", this.clientBase);
-    } catch (InterruptedException e) {
-      logger.info("Thread interrupted when attempting to stop the client: {}", this.clientBase);
+    /**
+     * For testing only
+     */
+    @VisibleForTesting
+    BasicClient(final ClientBase clientBase, ExecutorService executorService) {
+        this.canRun = new AtomicBoolean(true);
+        this.clientBase = clientBase;
+        this.executorService = executorService;
     }
-    executorService.shutdown();
-  }
 
-  @Override
-  public String getName() {
-    return clientBase.getName();
-  }
+    /**
+     * {@inheritDoc} Forks a new thread to do the IO in.
+     */
+    @Override
+    public void connect() {
+        if (!canRun.compareAndSet(true, false) || clientBase.isDone()) {
+            throw new IllegalStateException("There is already a connection thread running for " + this.clientBase);
+        }
+        executorService.execute(clientBase);
+        logger.info("New connection executed: {}", this.clientBase);
+    }
 
-  @Override
-  public StreamingEndpoint getEndpoint() {
-    return clientBase.getEndpoint();
-  }
+    @Override
+    public StatsReporter.StatsTracker getStatsTracker() {
+        return clientBase.getStatsTracker();
+    }
 
-  @Override
-  public void reconnect() {
-    clientBase.reconnect();
-  }
+    public boolean isDone() {
+        return clientBase.isDone();
+    }
 
-  @VisibleForTesting
-  boolean waitForFinish(int millis) throws InterruptedException {
-    return clientBase.waitForFinish(millis);
-  }
+    /**
+     * This method should only be called after the client is done
+     */
+    public Event getExitEvent() {
+        return clientBase.getExitEvent();
+    }
+
+    @Override
+    public void stop() {
+        stop(DEFAULT_STOP_TIMEOUT_MILLIS);
+    }
+
+    @Override
+    public void stop(int waitMillis) {
+        logger.info("Stopping the client: " + this.clientBase);
+        try {
+            clientBase.stop(waitMillis);
+            logger.info("Successfully stopped the client: {}", this.clientBase);
+        } catch (InterruptedException e) {
+            logger.info("Thread interrupted when attempting to stop the client: {}", this.clientBase);
+        }
+        executorService.shutdown();
+    }
+
+    @Override
+    public String getName() {
+        return clientBase.getName();
+    }
+
+    @Override
+    public StreamingEndpoint getEndpoint() {
+        return clientBase.getEndpoint();
+    }
+
+    @Override
+    public void reconnect() {
+        clientBase.reconnect();
+    }
+
+    @VisibleForTesting
+    boolean waitForFinish(int millis) throws InterruptedException {
+        return clientBase.waitForFinish(millis);
+    }
 }
